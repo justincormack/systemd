@@ -232,10 +232,6 @@ EFI_STATUS linux_exec(
                                 initrd,
                                 kernel_file_path);
 
-        err = pe_kernel_check_no_relocation(kernel->iov_base);
-        if (err != EFI_SUCCESS)
-                return err;
-
         /* As per MSFT requirement, memory pages need to be marked W^X, so mark code pages RO+X.
          * Firmwares will start enforcing this at some point in the near-ish future.
          * The kernel needs to mark this as supported explicitly, otherwise it will crash.
@@ -269,30 +265,69 @@ EFI_STATUS linux_exec(
                         AllocateAnyPages, EfiLoaderCode, EFI_SIZE_TO_PAGES(kernel_size_in_memory), 0);
 
         uint8_t* loaded_kernel = PHYSICAL_ADDRESS_TO_POINTER(loaded_kernel_pages.addr);
+
+        /* Copy PE headers (DOS header, PE header, section table) into the loaded image.
+         * The kernel's own EFI stub needs to parse its PE section table (e.g. to find
+         * .linux, .initrd sections) via the loaded image's ImageBase pointer. The headers
+         * occupy the space before the first section's VirtualAddress. Use SizeOfHeaders
+         * from the PE optional header for the correct size. */
+        {
+                size_t headers_size;
+                err = pe_kernel_get_headers_size(kernel->iov_base, &headers_size);
+                if (err != EFI_SUCCESS)
+                        return log_error_status(err, "Cannot read PE headers size: %m");
+                if (headers_size > kernel->iov_len)
+                        return log_error_status(EFI_LOAD_ERROR, "PE SizeOfHeaders exceeds file size");
+                if (headers_size > kernel_size_in_memory)
+                        return log_error_status(EFI_LOAD_ERROR, "PE SizeOfHeaders exceeds SizeOfImage");
+                memcpy(loaded_kernel, kernel->iov_base, headers_size);
+        }
+
+        /* First pass: copy all sections into the loaded image */
         FOREACH_ARRAY(h, headers, n_headers) {
-                if (h->PointerToRelocations != 0)
-                        return log_error_status(EFI_LOAD_ERROR, "Inner kernel image contains sections with relocations, which we do not support.");
                 if (h->SizeOfRawData == 0)
                         continue;
 
-                if (UINT32_MAX - h->VirtualAddress < h->SizeOfRawData)
-                        return log_error_status(EFI_LOAD_ERROR, "Invalid PE section, SizeOfRawData + VirtualAddress, overflows");
-                if (h->VirtualAddress + h->SizeOfRawData > kernel_size_in_memory)
+                /* SizeOfRawData is rounded up to FileAlignment per the PE spec, so it
+                 * can legitimately exceed VirtualSize. Only copy up to VirtualSize in
+                 * that case, matching pe_locate_sections_internal(). */
+                size_t copy_size = MIN(h->SizeOfRawData, h->VirtualSize);
+
+                if (UINT32_MAX - h->VirtualAddress < h->VirtualSize)
+                        return log_error_status(EFI_LOAD_ERROR, "Invalid PE section, VirtualSize + VirtualAddress overflows");
+                if (h->VirtualAddress + h->VirtualSize > kernel_size_in_memory)
                         return log_error_status(EFI_LOAD_ERROR, "Section would write outside of memory");
-                if (h->SizeOfRawData > h->VirtualSize)
-                        return log_error_status(EFI_LOAD_ERROR, "Invalid PE section, raw data size is greater than virtual size");
                 if (UINT32_MAX - h->PointerToRawData < h->SizeOfRawData)
                         return log_error_status(EFI_LOAD_ERROR, "Invalid PE section, PointerToRawData + SizeOfRawData overflows");
                 if (h->PointerToRawData + h->SizeOfRawData > kernel->iov_len)
                         return log_error_status(EFI_LOAD_ERROR, "Invalid PE section, raw data extends outside of file");
                 memcpy(loaded_kernel + h->VirtualAddress,
                        (const uint8_t*)kernel->iov_base + h->PointerToRawData,
-                       h->SizeOfRawData);
-                memzero(loaded_kernel + h->VirtualAddress + h->SizeOfRawData,
-                        h->VirtualSize - h->SizeOfRawData);
+                       copy_size);
+                if (h->VirtualSize > copy_size)
+                        memzero(loaded_kernel + h->VirtualAddress + copy_size,
+                                h->VirtualSize - copy_size);
+        }
 
-                /* Not a code section? Nothing to do, leave as-is. */
-                if (memory_proto && (h->Characteristics & (PE_CODE|PE_EXECUTE))) {
+        /* Apply PE base relocations before marking pages RO+X. Some kernels (notably Ubuntu
+         * arm64 zboot-wrapped kernels) have absolute address references that must be fixed up
+         * when loaded at a different address than ImageBase. */
+        err = pe_kernel_apply_relocations(
+                        kernel->iov_base,
+                        loaded_kernel,
+                        kernel_size_in_memory,
+                        loaded_kernel_pages.addr);
+        if (err != EFI_SUCCESS)
+                return err;
+
+        /* Second pass: mark code sections RO+X for W^X compliance */
+        if (memory_proto) {
+                FOREACH_ARRAY(h, headers, n_headers) {
+                        if (h->SizeOfRawData == 0)
+                                continue;
+                        if (!(h->Characteristics & (PE_CODE|PE_EXECUTE)))
+                                continue;
+
                         nx_sections = xrealloc(nx_sections, n_nx_sections * sizeof(struct iovec), (n_nx_sections + 1) * sizeof(struct iovec));
                         nx_sections[n_nx_sections].iov_base = loaded_kernel + h->VirtualAddress;
                         nx_sections[n_nx_sections].iov_len = h->VirtualSize;
